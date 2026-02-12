@@ -1,0 +1,208 @@
+# ============================================================
+# docker-compose.yml — Budget App + MongoDB Replica Set
+#
+# Architecture :
+#   mongo1  → PRIMARY  (lecture + écriture)
+#   mongo2  → SECONDARY_1 (lecture seule, peut devenir primary)
+#   mongo3  → SECONDARY_2 (lecture seule, peut devenir primary)
+#   mongo-init → container one-shot qui configure le replica set
+#   backend → Node.js API (se connecte via replica set string)
+#
+# Réplication : MongoDB Replica Set (oplog, asynchrone)
+# Failover    : élection automatique via heartbeat (≈10s)
+# ============================================================
+
+services:
+
+  # ─────────────────────────────────────────────────────────
+  # NŒUD 1 — PRIMARY
+  # C'est lui qui reçoit toutes les écritures.
+  # priority: 2 dans le replica set = préféré comme primary.
+  # ─────────────────────────────────────────────────────────
+  mongo1:
+    image: mongo:7.0
+    container_name: mongo-primary
+    hostname: mongo1                      # nom utilisé dans la replica set string
+    restart: unless-stopped
+    command: >
+      mongod
+      --replSet rs0
+      --bind_ip_all
+      --port 27017
+    # --replSet rs0 → active le mode replica set nommé "rs0"
+    # --bind_ip_all → écoute sur toutes les interfaces réseau
+    ports:
+      - "27017:27017"                     # exposé pour pouvoir se connecter depuis l'hôte
+    volumes:
+      - mongo1_data:/data/db              # volume persistant pour les données
+      - mongo1_config:/data/configdb      # volume pour la config MongoDB
+    networks:
+      - mongo_cluster                     # réseau dédié isolé du reste
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ─────────────────────────────────────────────────────────
+  # NŒUD 2 — SECONDARY_1
+  # Réplique les données du primary via l'oplog.
+  # Lecture seule par défaut (MongoDB enforce ça nativement).
+  # ─────────────────────────────────────────────────────────
+  mongo2:
+    image: mongo:7.0
+    container_name: mongo-secondary1
+    hostname: mongo2
+    restart: unless-stopped
+    command: >
+      mongod
+      --replSet rs0
+      --bind_ip_all
+      --port 27017
+    ports:
+      - "27018:27017"                     # port différent sur l'hôte pour les tests
+    volumes:
+      - mongo2_data:/data/db
+      - mongo2_config:/data/configdb
+    networks:
+      - mongo_cluster
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ─────────────────────────────────────────────────────────
+  # NŒUD 3 — SECONDARY_2
+  # Identique à mongo2. Troisième nœud pour le quorum.
+  # Avec 3 nœuds : tolérance à 1 panne (2/3 = quorum atteint)
+  # ─────────────────────────────────────────────────────────
+  mongo3:
+    image: mongo:7.0
+    container_name: mongo-secondary2
+    hostname: mongo3
+    restart: unless-stopped
+    command: >
+      mongod
+      --replSet rs0
+      --bind_ip_all
+      --port 27017
+    ports:
+      - "27019:27017"
+    volumes:
+      - mongo3_data:/data/db
+      - mongo3_config:/data/configdb
+    networks:
+      - mongo_cluster
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ─────────────────────────────────────────────────────────
+  # INIT — Container one-shot
+  # Lance le script init-replica.sh UNE SEULE FOIS au démarrage.
+  # Il attend que les 3 nœuds soient healthy, puis rs.initiate().
+  # Après ça, il meurt (c'est voulu).
+  # ─────────────────────────────────────────────────────────
+  mongo-init:
+    image: mongo:7.0
+    container_name: mongo-init
+    depends_on:
+      mongo1:
+        condition: service_healthy         # attend que mongo1 soit healthy
+      mongo2:
+        condition: service_healthy
+      mongo3:
+        condition: service_healthy
+    volumes:
+      - ./infra/mongo/init-replica.sh:/init-replica.sh:ro   # monte le script en read-only
+    command: bash /init-replica.sh
+    networks:
+      - mongo_cluster
+    restart: "no"                          # ne redémarre JAMAIS (one-shot)
+
+  # ─────────────────────────────────────────────────────────
+  # FRONTEND — React + Vite
+  # Accessible sur http://localhost:5173
+  # Communique avec le backend via localhost:3000 (port exposé)
+  # ─────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: budget-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: "http://localhost:3000"
+    depends_on:
+      - backend
+    volumes:
+      - ./src:/app/src
+      - ./index.html:/app/index.html
+
+  # ─────────────────────────────────────────────────────────
+  # BACKEND — Node.js + Express
+  # Se connecte via la replica set string complète.
+  # Si mongo1 tombe, le driver MongoDB switche automatiquement.
+  # ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: budget-backend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # CLEF : on liste les 3 nœuds + replicaSet=rs0
+      # Le driver MongoDB gère le failover tout seul avec ça
+      MONGO_URI: "mongodb://mongo1:27017,mongo2:27017,mongo3:27017/budgetapp?replicaSet=rs0&readPreference=primaryPreferred"
+      PORT: 3000
+      NODE_ENV: development
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully  # attend que l'init soit fini
+    networks:
+      - mongo_cluster
+    volumes:
+      - ./backend:/app                    # hot-reload pour le dev
+      - /app/node_modules                 # évite d'écraser le node_modules du container
+
+# ─────────────────────────────────────────────────────────────
+# VOLUMES NOMMÉS
+# Chaque nœud a son propre volume → données isolées et persistantes.
+# Si un container redémarre, les données sont conservées.
+# Ce sont des volumes Docker (gérés par Docker, pas des bind mounts).
+# ─────────────────────────────────────────────────────────────
+volumes:
+  mongo1_data:
+    driver: local
+  mongo1_config:
+    driver: local
+  mongo2_data:
+    driver: local
+  mongo2_config:
+    driver: local
+  mongo3_data:
+    driver: local
+  mongo3_config:
+    driver: local
+
+# ─────────────────────────────────────────────────────────────
+# RÉSEAU DÉDIÉ
+# Tous les containers communiquent sur ce réseau isolé.
+# Le backend ne peut joindre que les nœuds MongoDB, pas l'extérieur.
+# Les nœuds MongoDB ne sont pas accessibles depuis l'extérieur
+# (sauf via les ports exposés explicitement).
+# ─────────────────────────────────────────────────────────────
+networks:
+  mongo_cluster:
+    driver: bridge
+    name: mongo_cluster_network
