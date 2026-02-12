@@ -1,10 +1,5 @@
-#!/bin/bash
-# ============================================================
 # init-replica.sh
-# Ce script tourne dans un container one-shot au démarrage.
-# Il attend que les 3 nœuds soient prêts, puis initialise
-# le replica set et assigne les rôles PRIMARY / SECONDARY.
-# ============================================================
+
 
 echo "⏳ Attente que mongo1 (primary) soit prêt..."
 until mongosh --host mongo1:27017 --quiet --eval "db.adminCommand('ping')" &>/dev/null; do
